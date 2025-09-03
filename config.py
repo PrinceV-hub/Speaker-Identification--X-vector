@@ -1,0 +1,9 @@
+# Configuration parameters
+SAMPLE_RATE = 16000
+N_MFCC = 23
+WINDOW_LENGTH = 400
+STEP_SIZE = 200
+BATCH_SIZE = 64
+EPOCHS = 50
+LEARNING_RATE = 0.001
+NUM_CLASSES = 5  # Number of speakers
