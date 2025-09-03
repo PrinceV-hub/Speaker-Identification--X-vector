@@ -1,1 +1,288 @@
+import os
+import numpy as np
+import tensorflow as tf
+import matplotlib.pyplot as plt
+import pandas as pd
+import librosa
+from tqdm import tqdm
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import confusion_matrix, classification_report, pairwise
+import seaborn as sns
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import (
+    Input, Dense, Conv1D, BatchNormalization, Dropout,
+    GlobalAveragePooling1D, Concatenate, Lambda
+)
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import ModelCheckpoint, ReduceLROnPlateau, EarlyStopping
+from tensorflow.keras.utils import to_categorical
+from sklearn.manifold import TSNE
+from sklearn.decomposition import PCA
+import pickle
+from datetime import datetime
+import warnings
+warnings.filterwarnings('ignore')
 
+# Data path
+DATA_PATH = "16000_pcm_speeches/"  # Update to your local dataset path
+
+# Step 1: Data Loading
+def load_data(data_path):
+    speakers = [f for f in os.listdir(data_path)
+                if os.path.isdir(os.path.join(data_path, f))
+                and not f.startswith("_")
+                and not f.lower().startswith("other")]
+    data_info = []
+    for spk in speakers:
+        folder = os.path.join(data_path, spk)
+        files = [f for f in os.listdir(folder) if f.endswith(".wav")]
+        for f in files:
+            file_path = os.path.join(folder, f)
+            y, sr = librosa.load(file_path, sr=None)
+            duration = librosa.get_duration(y=y, sr=sr)
+            data_info.append([spk, f, sr, duration, file_path])
+    df = pd.DataFrame(data_info, columns=["speaker", "file", "sample_rate", "duration", "file_path"])
+    return df, speakers
+
+# Step 2: Feature Extraction
+def extract_mfcc_features(audio_path, sr=16000, n_mfcc=23, n_fft=512, hop_length=160):
+    try:
+        y, _ = librosa.load(audio_path, sr=sr)
+        y, _ = librosa.effects.trim(y, top_db=20)
+        mfccs = librosa.feature.mfcc(
+            y=y, sr=sr, n_mfcc=n_mfcc, n_fft=n_fft, hop_length=hop_length,
+            window='hamming', center=False
+        )
+        mfccs = mfccs - np.mean(mfccs, axis=1, keepdims=True)
+        return mfccs.T
+    except Exception as e:
+        print(f"Error extracting features from {audio_path}: {e}")
+        return None
+
+def create_segments(features, window_length=400, step_size=200):
+    if features.shape[0] < window_length:
+        padding = window_length - features.shape[0]
+        features = np.pad(features, ((0, padding), (0, 0)), mode='constant', constant_values=0)
+        return np.array([features])
+    segments = []
+    start = 0
+    while start + window_length <= features.shape[0]:
+        segment = features[start:start + window_length]
+        segments.append(segment)
+        start += step_size
+        if len(segments) >= 50:
+            break
+    return np.array(segments) if segments else np.array([])
+
+# Step 3: Build Dataset
+def build_feature_dataset(df, n_mfcc=23, window_length=400, step_size=200, max_files_per_speaker=None):
+    X_segments = []
+    y_labels = []
+    speaker_segment_counts = {}
+    speakers = sorted(df['speaker'].unique())
+    label_encoder = LabelEncoder()
+    label_encoder.fit(speakers)
+    
+    for speaker_idx, speaker in enumerate(speakers):
+        speaker_files = df[df['speaker'] == speaker]['file_path'].values
+        if max_files_per_speaker:
+            speaker_files = speaker_files[:max_files_per_speaker]
+        speaker_segments = []
+        files_processed = 0
+        for file_path in tqdm(speaker_files, desc=f"Processing {speaker}"):
+            features = extract_mfcc_features(file_path, n_mfcc=n_mfcc)
+            if features is not None:
+                segments = create_segments(features, window_length, step_size)
+                if len(segments) > 0:
+                    for segment in segments:
+                        speaker_segments.append(segment)
+                        y_labels.append(speaker_idx)
+                    files_processed += 1
+        X_segments.extend(speaker_segments)
+        speaker_segment_counts[speaker] = len(speaker_segments)
+    
+    X_segments = np.array(X_segments, dtype=np.float32)
+    y_labels = np.array(y_labels, dtype=np.int32)
+    return X_segments, y_labels, label_encoder, speaker_segment_counts
+
+# Step 4: Create X-Vector Model
+def create_xvector_model(input_shape, num_classes):
+    inputs = Input(shape=input_shape, name='input')
+    x = Conv1D(512, kernel_size=5, dilation_rate=1, activation='relu', name='tdnn1')(inputs)
+    x = BatchNormalization(name='bn1')(x)
+    x = Conv1D(512, kernel_size=3, dilation_rate=2, activation='relu', name='tdnn2')(x)
+    x = BatchNormalization(name='bn2')(x)
+    x = Conv1D(512, kernel_size=3, dilation_rate=3, activation='relu', name='tdnn3')(x)
+    x = BatchNormalization(name='bn3')(x)
+    x = Conv1D(512, kernel_size=1, dilation_rate=1, activation='relu', name='tdnn4')(x)
+    x = BatchNormalization(name='bn4')(x)
+    x = Conv1D(1500, kernel_size=1, dilation_rate=1, activation='relu', name='tdnn5')(x)
+    x = BatchNormalization(name='bn5')(x)
+    mean = GlobalAveragePooling1D(name='global_mean')(x)
+    mean_expanded = Lambda(lambda x: tf.keras.backend.expand_dims(x, axis=1))(mean)
+    mean_tiled = Lambda(lambda x: tf.keras.backend.tile(x[0], [1, tf.keras.backend.shape(x[1])[1], 1]))([mean_expanded, x])
+    variance = Lambda(lambda x: tf.keras.backend.mean(tf.keras.backend.square(x[0] - x[1]), axis=1))([x, mean_tiled])
+    std = Lambda(lambda x: tf.keras.backend.sqrt(tf.keras.backend.maximum(x, 1e-8)))(variance)
+    stats = Concatenate(name='stats_pool')([mean, std])
+    x = Dense(512, activation='relu', name='segment1')(stats)
+    x = BatchNormalization(name='bn6')(x)
+    x = Dropout(0.5, name='dropout1')(x)
+    embeddings = Dense(512, activation='relu', name='embeddings')(x)
+    x = BatchNormalization(name='bn7')(embeddings)
+    x = Dropout(0.5, name='dropout2')(x)
+    outputs = Dense(num_classes, activation='softmax', name='classification')(x)
+    model = Model(inputs=inputs, outputs=outputs, name='XVector')
+    return model
+
+# Step 5: Train Model
+def train_model(X_train, y_train_cat, X_val, y_val_cat, input_shape, num_classes):
+    model = create_xvector_model(input_shape, num_classes)
+    optimizer = Adam(learning_rate=0.001)
+    model.compile(optimizer=optimizer, loss='categorical_crossentropy', metrics=['accuracy'])
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    model_name = f"xvector_speaker_recognition_{timestamp}"
+    callbacks = [
+        ModelCheckpoint(filepath=f'{model_name}_best.h5', monitor='val_accuracy', save_best_only=True, mode='max', verbose=1),
+        ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=1e-6, verbose=1),
+        EarlyStopping(monitor='val_loss', patience=12, restore_best_weights=True, verbose=1)
+    ]
+    history = model.fit(
+        X_train, y_train_cat, batch_size=64, epochs=50,
+        validation_data=(X_val, y_val_cat), callbacks=callbacks, verbose=1, shuffle=True
+    )
+    return model, history, model_name
+
+# Step 6: Evaluate Model
+def evaluate_model(model, X_test, y_test_cat, y_test, label_encoder):
+    test_loss, test_accuracy = model.evaluate(X_test, y_test_cat, verbose=0)
+    print(f"Test accuracy: {test_accuracy*100:.2f}%")
+    test_predictions = model.predict(X_test, verbose=0)
+    test_pred_labels = np.argmax(test_predictions, axis=1)
+    cm = confusion_matrix(y_test, test_pred_labels)
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                xticklabels=label_encoder.classes_, yticklabels=label_encoder.classes_)
+    plt.title('Confusion Matrix - Speaker Recognition')
+    plt.xlabel('Predicted Speaker')
+    plt.ylabel('True Speaker')
+    plt.show()
+
+# Step 7: Extract and Analyze Embeddings
+def extract_and_analyze_embeddings(model, X_train, X_val, X_test, y_train, y_val, y_test, label_encoder):
+    embedding_model = Model(inputs=model.input, outputs=model.get_layer('embeddings').output)
+    train_embeddings = embedding_model.predict(X_train, batch_size=64, verbose=1)
+    val_embeddings = embedding_model.predict(X_val, batch_size=64, verbose=1)
+    test_embeddings = embedding_model.predict(X_test, batch_size=64, verbose=1)
+    
+    # Speaker Prototypes
+    speaker_prototypes = {}
+    for i, speaker in enumerate(label_encoder.classes_):
+        speaker_mask = y_test == i
+        speaker_embeddings = test_embeddings[speaker_mask]
+        if len(speaker_embeddings) > 0:
+            prototype = np.mean(speaker_embeddings, axis=0)
+            speaker_prototypes[speaker] = prototype
+    
+    # Save embeddings and prototypes
+    np.save('train_embeddings.npy', train_embeddings)
+    np.save('val_embeddings.npy', val_embeddings)
+    np.save('test_embeddings.npy', test_embeddings)
+    np.save('train_labels.npy', y_train)
+    np.save('val_labels.npy', y_val)
+    np.save('test_labels.npy', y_test)
+    with open('speaker_prototypes.pkl', 'wb') as f:
+        pickle.dump(speaker_prototypes, f)
+    
+    # t-SNE Visualization
+    pca = PCA(n_components=50, random_state=42)
+    test_embeddings_pca = pca.fit_transform(test_embeddings)
+    tsne = TSNE(n_components=2, random_state=42, perplexity=30, n_iter=1000)
+    embeddings_2d = tsne.fit_transform(test_embeddings_pca)
+    plt.figure(figsize=(12, 8))
+    colors = ['red', 'blue', 'green', 'orange', 'purple']
+    markers = ['o', 's', '^', 'D', 'v']
+    for i, speaker in enumerate(label_encoder.classes_):
+        mask = y_test == i
+        plt.scatter(embeddings_2d[mask, 0], embeddings_2d[mask, 1],
+                    c=colors[i], marker=markers[i], label=f"{speaker} ({np.sum(mask)} samples)",
+                    alpha=0.7, s=50)
+    plt.title('X-Vector Embeddings Visualization (t-SNE)')
+    plt.xlabel('t-SNE Component 1')
+    plt.ylabel('t-SNE Component 2')
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.grid(True, alpha=0.3)
+    plt.show()
+    
+    return embedding_model, speaker_prototypes
+
+# Step 8: Speaker Identification and Verification
+def predict_speaker(audio_file_path, embedding_model, speaker_prototypes, label_encoder):
+    segments = get_mfcc_segments(audio_file_path)
+    segment_embeddings = embedding_model.predict(segments, verbose=0)
+    final_embedding = np.mean(segment_embeddings, axis=0).reshape(1, -1)
+    similarities = {speaker: pairwise.cosine_similarity(final_embedding, proto.reshape(1, -1))[0][0]
+                    for speaker, proto in speaker_prototypes.items()}
+    predicted_speaker = max(similarities, key=similarities.get)
+    best_score = similarities[predicted_speaker]
+    print(f"\nPredicted Speaker → {predicted_speaker} (score: {best_score:.4f})")
+    return predicted_speaker, similarities
+
+def get_mfcc_segments(audio_file_path, n_mfcc=23, window_length=400, step_size=200):
+    features = extract_mfcc_features(audio_file_path, n_mfcc=n_mfcc)
+    if features is None or features.shape[0] == 0:
+        raise ValueError("Error extracting MFCC features.")
+    segments = create_segments(features, window_length=window_length, step_size=step_size)
+    if len(segments) == 0:
+        raise ValueError("Audio too short for segmentation.")
+    return np.array(segments, dtype=np.float32)
+
+# Main Execution
+def main():
+    # Configuration
+    SAMPLE_RATE = 16000
+    N_MFCC = 23
+    WINDOW_LENGTH = 400
+    STEP_SIZE = 200
+    MIN_DURATION = 1.0
+    
+    # Load data
+    df, speakers = load_data(DATA_PATH)
+    df_filtered = df[df['duration'] >= MIN_DURATION].copy()
+    
+    # Build dataset
+    X_data, y_data, label_encoder, segment_counts = build_feature_dataset(
+        df_filtered, n_mfcc=N_MFCC, window_length=WINDOW_LENGTH, step_size=STEP_SIZE
+    )
+    
+    # Split data
+    X_temp, X_test, y_temp, y_test = train_test_split(
+        X_data, y_data, test_size=0.05, random_state=42, stratify=y_data
+    )
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_temp, y_temp, test_size=0.1875, random_state=42, stratify=y_temp
+    )
+    
+    # Convert to categorical labels
+    num_classes = len(label_encoder.classes_)
+    y_train_cat = to_categorical(y_train, num_classes)
+    y_val_cat = to_categorical(y_val, num_classes)
+    y_test_cat = to_categorical(y_test, num_classes)
+    
+    # Train model
+    model, history, model_name = train_model(X_train, y_train_cat, X_val, y_val_cat, (WINDOW_LENGTH, N_MFCC), num_classes)
+    
+    # Evaluate model
+    evaluate_model(model, X_test, y_test_cat, y_test, label_encoder)
+    
+    # Extract and analyze embeddings
+    embedding_model, speaker_prototypes = extract_and_analyze_embeddings(
+        model, X_train, X_val, X_test, y_train, y_val, y_test, label_encoder
+    )
+    
+    # Example speaker identification
+    audio_path = os.path.join(DATA_PATH, "Magaret_Tarcher/1006.wav")
+    predict_speaker(audio_path, embedding_model, speaker_prototypes, label_encoder)
+
+if __name__ == "__main__":
+    main()
